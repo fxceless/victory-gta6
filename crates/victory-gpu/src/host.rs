@@ -10447,8 +10447,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
-    // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // into title memory: in place writes if asked for; else through kernel.
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len))
+        || (title_dst && crate::plaincopy::write(dst, src, len))
+        || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -10579,8 +10581,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
     let direct = direct_writes();
+    let plain = direct && crate::plaincopy::writes_on();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if plain {
+            return crate::plaincopy::write(at as *mut u8, from, n);
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and

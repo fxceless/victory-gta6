@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 core::arch::global_asm!(
     ".globl victory_copy_guarded",
     ".globl victory_copy_guarded_at",
+    ".globl victory_write_guarded",
+    ".globl victory_write_guarded_at",
     ".globl victory_copy_guarded_fault",
     "victory_copy_guarded:",
     // rcx: to, rdx: from, r8: bytes. rsi and rdi are the caller's: kept in
@@ -34,8 +36,20 @@ core::arch::global_asm!(
     "    mov rdi, rcx",
     "    mov rsi, rdx",
     "    mov rcx, r8",
+    "    cld",
     "victory_copy_guarded_at:",
     "    rep movsb",
+    "    jmp .Lvictory_copy_guarded_ok",
+    "victory_write_guarded:",
+    "    mov r9, rsi",
+    "    mov r10, rdi",
+    "    mov rdi, rcx",
+    "    mov rsi, rdx",
+    "    mov rcx, r8",
+    "    cld",
+    "victory_write_guarded_at:",
+    "    rep movsb",
+    ".Lvictory_copy_guarded_ok:",
     "    mov rsi, r9",
     "    mov rdi, r10",
     "    mov eax, 1",
@@ -50,16 +64,20 @@ core::arch::global_asm!(
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
+    fn victory_write_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_copy_guarded_at: u8;
+    static victory_write_guarded_at: u8;
     static victory_copy_guarded_fault: u8;
 }
 
 /// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// (`VICTORY_COPY_PLAIN=1`, or `VICTORY_DIRECT_COPY=1` for both directions).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+        let on = cfg!(target_arch = "x86_64")
+            && (std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1")
+                || std::env::var_os("VICTORY_DIRECT_COPY").is_some_and(|v| v == "1"));
         if on {
             install();
             tracing::info!(
@@ -71,12 +89,28 @@ pub(crate) fn on() -> bool {
     })
 }
 
-/// Copies made in place, their bytes, the copies that met a page that was
-/// not there (and went to the kernel's copy), and the copies not tried in
-/// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line; and the fills of under
-/// [`LEAST`] bytes made in place ([`copy_short`]).
-static COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Whether writes back into title memory are made in place
+/// (`VICTORY_COPY_PLAIN_WRITES=1` or `VICTORY_DIRECT_COPY=1`).
+pub(crate) fn writes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(target_arch = "x86_64")
+            && (std::env::var_os("VICTORY_COPY_PLAIN_WRITES").is_some_and(|v| v == "1")
+                || std::env::var_os("VICTORY_DIRECT_COPY").is_some_and(|v| v == "1"));
+        if on {
+            install();
+            tracing::info!(
+                "writes into title memory are made in place, guarded against unmapped and PAGE_GUARD pages \
+                 (VICTORY_COPY_PLAIN_WRITES=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Reads: copies, bytes, faults, skipped (recent), skipped (small), short fills;
+/// Writes: copies, bytes, faults.
+static COUNT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -127,35 +161,92 @@ fn note_fault(from: usize, len: usize) {
     RECENT[last & 1023].store(last, Relaxed);
 }
 
-/// The handler that turns a read fault inside [`guarded`] into its return
-/// of false; put first in the line, once.
+/// Re-arms `PAGE_GUARD` on the 4 KiB page containing `at` after `rep movsb`
+/// consumed the one-shot guard bit while raising `EXCEPTION_GUARD_PAGE`.
+#[cfg(target_arch = "x86_64")]
+fn rearm_guard(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualProtect,
+        VirtualQuery,
+    };
+    let page = (at & !0xfff) as *const std::ffi::c_void;
+    // SAFETY: plain stack buffer populated by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: querying one page and re-applying its guard flag if still committed.
+    unsafe {
+        if VirtualQuery(page, &mut info, size_of_val(&info)) != 0
+            && info.State == MEM_COMMIT
+            && info.Protect != PAGE_NOACCESS
+            && info.Protect & PAGE_GUARD == 0
+        {
+            let mut old = 0;
+            VirtualProtect(page, 0x1000, info.Protect | PAGE_GUARD, &mut old);
+        }
+    }
+}
+
+/// The handler that turns a read or write fault inside [`guarded`] /
+/// [`guarded_write`] into a `false` return; put first in line, once.
 #[cfg(target_arch = "x86_64")]
 fn install() {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        // Only at the copy's own instruction.
-        if context.Rip != (&raw const victory_copy_guarded_at) as u64 {
+        let is_read_at = context.Rip == (&raw const victory_copy_guarded_at) as u64;
+        let is_write_at = context.Rip == (&raw const victory_write_guarded_at) as u64;
+        if !is_read_at && !is_write_at {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        if r.ExceptionCode == EXCEPTION_GUARD_PAGE {
+            if r.NumberParameters >= 2 {
+                rearm_guard(r.ExceptionInformation[1]);
+            }
+            context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         const READ: usize = 0;
-        let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
-        let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
-        if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
+        const WRITE: usize = 1;
+        if is_read_at {
+            let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
+            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+                || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR)
+                && read;
+            if gone {
+                context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] == WRITE
+        {
+            if crate::watch::handle_write_fault(r.ExceptionInformation[1]) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR
+            && r.NumberParameters >= 1
+            && r.ExceptionInformation[0] == WRITE
+        {
             context.Rip = (&raw const victory_copy_guarded_fault) as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: a handler that reads the record it is given and nothing else.
+    // SAFETY: a handler that reads the record it is given and only intercepts
+    // faults inside `victory_copy_guarded_at` / `victory_write_guarded_at`.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_fault));
     });
@@ -165,20 +256,33 @@ fn install() {
 fn install() {}
 
 /// Copies `len` bytes from `from` to `to` in place; false if a page of the
-/// source was not there (then some of `to` may have been written).
-///
-/// `to` must be writable memory of `len` bytes that is ours (host memory);
-/// `from` may be anything.
+/// source was not there or had `PAGE_GUARD` (then some of `to` may have been
+/// written).
 #[cfg(target_arch = "x86_64")]
 fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
     install();
-    // SAFETY: the destination is the caller's to write; a source page that
-    // is not there ends the copy with 0 instead of a fault ([`install`]).
+    // SAFETY: `to` is caller-owned writable memory; source faults are handled
+    // by `on_fault`.
     unsafe { victory_copy_guarded(to, from, len) != 0 }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
+    false
+}
+
+/// Writes `len` bytes from host memory `from` into title memory `to` in place;
+/// false if a destination page is unmapped, read-only, or `PAGE_GUARD`.
+#[cfg(target_arch = "x86_64")]
+fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
+    install();
+    // SAFETY: `from` is mapped host memory; destination faults are intercepted
+    // by `on_fault` (`watch::handle_write_fault`, `rearm_guard`, or fault bailout).
+    unsafe { victory_write_guarded(to, from, len) != 0 }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn guarded_write(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
 }
 
@@ -238,25 +342,52 @@ pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// With [`writes_on`]: writes host memory `from` into title memory `to`
+/// in place; false if disabled or a destination page is unmapped, read-only,
+/// or `PAGE_GUARD`.
+pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !writes_on() {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+    let whole = guarded_write(to, from, len);
+    if whole {
+        COUNT[6].fetch_add(1, Relaxed);
+        COUNT[7].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[8].fetch_add(1, Relaxed);
+    }
+    whole
+}
+
 /// The fewest bytes [`copy`] takes: what is shorter is [`copy_short`]'s,
 /// for callers that may use it.
 pub(crate) const fn least() -> usize {
     LEAST
 }
 
-/// With the frame line: what [`copy`] did per frame over `frames`.
+/// With the frame line: what [`copy`] and [`write`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
-    if !on() {
-        return;
+    if on() {
+        let [copies, bytes, gone, lately, small, fills] =
+            [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+             that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
+             faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
+             (VICTORY_FILLS_PLAIN): {fills:.0}",
+            bytes / 1e6
+        );
     }
-    let [copies, bytes, gone, lately, small, fills] = [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
-    tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
-         that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
-         (VICTORY_FILLS_PLAIN): {fills:.0}",
-        bytes / 1e6
-    );
+    if writes_on() {
+        let [writes, bytes, faults] = [6, 7, 8].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "writes into title memory made in place per frame (VICTORY_COPY_PLAIN_WRITES=1): {writes:.0}, {:.1} MB; {faults:.1} faulted",
+            bytes / 1e6
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -381,5 +512,112 @@ mod tests {
         }
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn guard_page_fails_copy_and_stays_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+        };
+        // SAFETY: test-owned two-page allocation freed at the end.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(0x55, 2 * PAGE);
+            let p1 = base.add(PAGE);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(p1.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                0
+            );
+
+            let mut dst = vec![0u8; 2 * PAGE];
+            assert!(!guarded(dst.as_mut_ptr(), base, 2 * PAGE));
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(
+                VirtualQuery(p1.cast(), &mut info, size_of_val(&info)),
+                0
+            );
+            assert_ne!(
+                info.Protect & PAGE_GUARD,
+                0,
+                "PAGE_GUARD must remain armed after guarded read"
+            );
+
+            let src = vec![0x77u8; 2 * PAGE];
+            assert!(!guarded_write(base, src.as_ptr(), 2 * PAGE));
+            assert_ne!(
+                VirtualQuery(p1.cast(), &mut info, size_of_val(&info)),
+                0
+            );
+            assert_ne!(
+                info.Protect & PAGE_GUARD,
+                0,
+                "PAGE_GUARD must remain armed after guarded write"
+            );
+
+            // Clearing PAGE_GUARD restores full read/write success cleanly.
+            assert_ne!(
+                VirtualProtect(p1.cast(), PAGE, PAGE_READWRITE, &mut old),
+                0
+            );
+            assert!(guarded_write(base, src.as_ptr(), 2 * PAGE));
+            assert!(std::slice::from_raw_parts(base, 2 * PAGE).iter().all(|&b| b == 0x77));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn guarded_write_skips_unmapped_and_readonly_and_marks_write_watch() {
+        use windows_sys::Win32::System::Memory::{
+            GetWriteWatch, PAGE_READONLY, ResetWriteWatch, VirtualProtect,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: private test allocations freed before returning.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            let p2 = base.add(2 * PAGE);
+            assert_eq!(VirtualAlloc(p2.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), p2.cast());
+            p2.write_bytes(0x5a, PAGE);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(p2.cast(), PAGE, PAGE_READONLY, &mut old), 0);
+
+            let src = vec![0xa3u8; 3 * PAGE];
+            assert!(!guarded_write(base, src.as_ptr(), 3 * PAGE));
+            assert!(std::slice::from_raw_parts(base, PAGE).iter().all(|&b| b == 0xa3));
+            assert!(!guarded_write(p2, src.as_ptr(), PAGE));
+            assert!(std::slice::from_raw_parts(p2, PAGE).iter().all(|&b| b == 0x5a));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+
+            let ww = VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!ww.is_null());
+            assert_eq!(ResetWriteWatch(ww.cast(), 2 * PAGE), 0);
+            let payload = vec![0x42u8; PAGE];
+            assert!(guarded_write(ww.add(PAGE), payload.as_ptr(), PAGE));
+            let mut dirty = [std::ptr::null_mut(); 4];
+            let mut count = dirty.len();
+            let mut granularity = 0;
+            assert_eq!(
+                GetWriteWatch(0, ww.cast(), 2 * PAGE, dirty.as_mut_ptr(), &mut count, &mut granularity),
+                0
+            );
+            assert_eq!(count, 1);
+            assert_eq!(dirty[0] as usize, ww.add(PAGE) as usize);
+            assert_ne!(VirtualFree(ww.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }
