@@ -164,7 +164,7 @@ pub(super) fn folded(result: u32) -> u32 {
     result >> 1
 }
 
-/// The hash the compare on the card ([`CARD_COMPARE`]) makes of a piece
+/// The hash the compare on the card ([`super::card_compare::CARD_COMPARE`]) makes of a piece
 /// that holds `bytes` (a multiple of 16 of them), as [`folded`].
 pub(super) fn hash(bytes: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
